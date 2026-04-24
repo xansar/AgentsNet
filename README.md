@@ -54,6 +54,7 @@ Then, you can start a run:
 python main.py --graph_size 16 --task coloring --rounds 8 --samples_per_graph_model 3 --model gemini-2.0-flash 
 ```
 This runs 12 instances of the coloring task of 16 nodes for 8 rounds, with 4 different graph classes and 3 samples per graph class each, with gemini-2.0-flash as the model. See `main.sh` to run a complete run of the benchmark for one particular model.
+Results are written to `results/<task>/<graph_type>/` by default. Use `--output_dir path/to/run_results` to choose a different root directory; task and graph-type subdirectories are still created under that root.
 
 Experiments are serial by default. To run multiple graph/sample/repeated-run experiments concurrently within one `main.py` process, set:
 ```bash

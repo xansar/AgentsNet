@@ -146,7 +146,7 @@ def safe_filename_part(value):
     return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(value))
 
 
-def save_results(answers, transcripts, graph, rounds, model_name, task, score, commit_hash, graph_generator, graph_index, successful, error_message, chain_of_thought, num_fallbacks, num_failed_json_parsings_after_retry, num_failed_answer_parsings_after_retry, model_errors=None, run_index=0, run_id=None, logger=None):
+def save_results(answers, transcripts, graph, rounds, model_name, task, score, commit_hash, graph_generator, graph_index, successful, error_message, chain_of_thought, num_fallbacks, num_failed_json_parsings_after_retry, num_failed_answer_parsings_after_retry, model_errors=None, run_index=0, run_id=None, logger=None, output_dir="results"):
     """Saves the experiment results and message transcripts to a JSON file."""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_model = safe_filename_part(model_name.split("/")[-1])
@@ -157,10 +157,10 @@ def save_results(answers, transcripts, graph, rounds, model_name, task, score, c
         f"_nodes{len(graph.nodes())}.json"
     )
 
-    output_dir = "results"
-    os.makedirs(output_dir, exist_ok=True)
+    task_output_dir = os.path.join(output_dir, safe_filename_part(task), safe_graph_generator)
+    os.makedirs(task_output_dir, exist_ok=True)
 
-    filepath = os.path.join(output_dir, filename)
+    filepath = os.path.join(task_output_dir, filename)
 
     with open(filepath, "w") as f:
         json.dump({
@@ -438,6 +438,7 @@ async def run_single_experiment(args, spec, commit_hash, logger):
             run_index=spec.run_index,
             run_id=spec.run_id,
             logger=logger,
+            output_dir=getattr(args, "output_dir", "results"),
         )
     except Exception as e:
         successful = False
@@ -499,6 +500,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_parallel_experiments", type=int, default=1)
     parser.add_argument("--log_level", type=str, default="INFO")
     parser.add_argument("--log_file", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default="results")
     args = parser.parse_args()
     if args.max_parallel_experiments < 1:
         parser.error("--max_parallel_experiments must be >= 1")

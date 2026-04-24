@@ -1,5 +1,7 @@
 from abc import ABC
 import asyncio
+import datetime
+import hashlib
 import networkx as nx
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, messages_to_dict
 from langchain_core.prompts import PromptTemplate
@@ -205,7 +207,13 @@ class LiteralMessagePassing(ABC):
         self.transcripts = []
 
         def call_model(state: MessagesState):
-            response = self.model.invoke(state["messages"])
+            try:
+                response = self.model.invoke(state["messages"])
+            except Exception as exc:
+                exc.model_request_messages = self._serialize_messages_for_error(
+                    state.get("messages", [])
+                )
+                raise
             return {"messages": response}
             
         self.workflow.add_edge(START, "model")
@@ -284,8 +292,76 @@ It is not mandatory to send a message to every neighbor in every round. If you d
             model=model_name,
         )
 
+    def _safe_filename_part(self, value):
+        return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(value))
+
+    def _serialize_messages_for_error(self, messages):
+        try:
+            return messages_to_dict(messages)
+        except Exception:
+            serialized = []
+            for message in messages:
+                serialized.append(
+                    {
+                        "type": type(message).__name__,
+                        "content": getattr(message, "content", str(message)),
+                    }
+                )
+            return serialized
+
+    def _is_invalid_prompt_error(self, exc):
+        error_text = str(exc).lower()
+        return "invalid_prompt" in error_text or "invalid prompt" in error_text
+
+    def _save_invalid_prompt(self, node_id, node_name, phase, exc, request_messages):
+        if not request_messages:
+            return None
+
+        timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S_%fZ")
+        run_part = self._safe_filename_part(self.run_id or "no_run_id")
+        phase_part = self._safe_filename_part(phase)
+        node_part = self._safe_filename_part(f"{node_id}_{node_name}")
+        digest = hashlib.sha256(
+            json.dumps(request_messages, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:12]
+        prompt_dir = os.path.join("invalid_prompts", run_part)
+        os.makedirs(prompt_dir, exist_ok=True)
+        prompt_path = os.path.join(
+            prompt_dir,
+            f"{timestamp}_{phase_part}_{node_part}_{digest}.json",
+        )
+
+        with open(prompt_path, "w") as f:
+            json.dump(
+                {
+                    "timestamp_utc": timestamp,
+                    "run_id": self.run_id,
+                    "model_name": self.model_name,
+                    "node_id": node_id,
+                    "node_name": node_name,
+                    "phase": phase,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                    "messages": request_messages,
+                },
+                f,
+                indent=4,
+                ensure_ascii=False,
+            )
+        return prompt_path
+
     def _record_model_error(self, node_id, phase, exc):
         node_name = self.graph.nodes[node_id].get("name", str(node_id))
+        request_messages = getattr(exc, "model_request_messages", None)
+        invalid_prompt_path = None
+        if self._is_invalid_prompt_error(exc):
+            invalid_prompt_path = self._save_invalid_prompt(
+                node_id,
+                node_name,
+                phase,
+                exc,
+                request_messages,
+            )
         error = {
             "node_id": node_id,
             "node_name": node_name,
@@ -294,6 +370,8 @@ It is not mandatory to send a message to every neighbor in every round. If you d
             "error_message": str(exc),
             "traceback": traceback.format_exc(),
         }
+        if invalid_prompt_path:
+            error["prompt_file"] = invalid_prompt_path
         self.model_errors.append(error)
         if self.logger:
             self.logger.error(
@@ -307,6 +385,7 @@ It is not mandatory to send a message to every neighbor in every round. If you d
                         "phase": phase,
                         "error_type": type(exc).__name__,
                         "error_message": str(exc),
+                        "prompt_file": invalid_prompt_path,
                     }
                 },
             )

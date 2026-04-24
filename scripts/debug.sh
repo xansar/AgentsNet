@@ -9,4 +9,6 @@ uv run main.py \
 --samples_per_graph_model 3 \
 --graph_models ws \
 --model gpt-5.4 \
---disable_chain_of_thought
+--disable_chain_of_thought \
+--output_dir results/260424-test \
+--max_parallel_experiments 3

@@ -25,6 +25,7 @@ def make_args(max_parallel_experiments=1, samples_per_graph_model=3):
         max_parallel_experiments=max_parallel_experiments,
         log_level="ERROR",
         log_file=None,
+        output_dir="results",
     )
 
 
@@ -119,6 +120,7 @@ class ParallelExperimentTests(unittest.TestCase):
         self.assertTrue(all(result["successful"] for result in results))
         self.assertEqual(FakeTask.max_active, 1)
         self.assertEqual(len(saved), 3)
+        self.assertTrue(all(item["output_dir"] == "results" for item in saved))
 
     def test_max_parallel_experiments_two(self):
         with mock.patch.object(main, "save_results", lambda **kwargs: "result.json"):
@@ -147,39 +149,64 @@ class ParallelExperimentTests(unittest.TestCase):
     def test_parallel_save_filenames_are_unique(self):
         graph = fake_graph("ws", 3, 0)
         with tempfile.TemporaryDirectory() as tmpdir:
-            previous_cwd = os.getcwd()
-            os.chdir(tmpdir)
-            try:
-                paths = [
-                    main.save_results(
-                        answers=["Group 1"] * 3,
-                        transcripts={},
-                        graph=graph,
-                        rounds=1,
-                        model_name="gpt-4o-mini",
-                        task="coloring",
-                        score=1.0,
-                        commit_hash="test-hash",
-                        graph_generator="ws",
-                        graph_index=0,
-                        successful=True,
-                        error_message=None,
-                        chain_of_thought=False,
-                        num_fallbacks=[0, 0, 0],
-                        num_failed_json_parsings_after_retry=[0, 0, 0],
-                        num_failed_answer_parsings_after_retry=[0, 0, 0],
-                        run_index=run_index,
-                        run_id=f"run-{run_index}",
-                    )
-                    for run_index in range(2)
-                ]
-            finally:
-                os.chdir(previous_cwd)
+            paths = [
+                main.save_results(
+                    answers=["Group 1"] * 3,
+                    transcripts={},
+                    graph=graph,
+                    rounds=1,
+                    model_name="gpt-4o-mini",
+                    task="coloring",
+                    score=1.0,
+                    commit_hash="test-hash",
+                    graph_generator="ws",
+                    graph_index=0,
+                    successful=True,
+                    error_message=None,
+                    chain_of_thought=False,
+                    num_fallbacks=[0, 0, 0],
+                    num_failed_json_parsings_after_retry=[0, 0, 0],
+                    num_failed_answer_parsings_after_retry=[0, 0, 0],
+                    run_index=run_index,
+                    run_id=f"run-{run_index}",
+                    output_dir=tmpdir,
+                )
+                for run_index in range(2)
+            ]
 
         self.assertEqual(len(set(paths)), 2)
         self.assertTrue(
             all(f"_graph0_run{run_index}_" in paths[run_index] for run_index in range(2))
         )
+        self.assertTrue(
+            all(os.path.dirname(path) == os.path.join(tmpdir, "coloring", "ws") for path in paths)
+        )
+
+    def test_save_results_uses_task_and_graph_subdirectories_under_output_dir(self):
+        graph = fake_graph("ws", 3, 0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = main.save_results(
+                answers=["Group 1"] * 3,
+                transcripts={},
+                graph=graph,
+                rounds=1,
+                model_name="gpt-4o-mini",
+                task="coloring",
+                score=1.0,
+                commit_hash="test-hash",
+                graph_generator="ws",
+                graph_index=0,
+                successful=True,
+                error_message=None,
+                chain_of_thought=False,
+                num_fallbacks=[0, 0, 0],
+                num_failed_json_parsings_after_retry=[0, 0, 0],
+                num_failed_answer_parsings_after_retry=[0, 0, 0],
+                output_dir=tmpdir,
+            )
+
+            self.assertTrue(path.startswith(os.path.join(tmpdir, "coloring", "ws", "")))
+            self.assertTrue(os.path.exists(path))
 
 
 if __name__ == "__main__":
