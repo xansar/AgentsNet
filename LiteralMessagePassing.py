@@ -1,19 +1,26 @@
 from abc import ABC
 import asyncio
 import networkx as nx
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
-from langchain.prompts import PromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, messages_to_dict
+from langchain_core.prompts import PromptTemplate
 import json
 import os
+import traceback
 from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_ollama import ChatOllama
-from langchain.schema import messages_to_dict
+from langchain_openai import AzureChatOpenAI
 import re
 import regex
 from utils import names
+
+try:
+    from azure.identity import AzureCliCredential, get_bearer_token_provider
+except ImportError:
+    AzureCliCredential = None
+    get_bearer_token_provider = None
 
 def parse_messages(response: str) -> dict[str, str]:
     response = response.replace("\\n", "\n")
@@ -150,13 +157,29 @@ RATE_LIMITER_KWARGS = {
 
 
 class LiteralMessagePassing(ABC):
-    def __init__(self, graph, model_name="gpt-4o", model_provider="openai", chain_of_thought=True):
+    def __init__(
+        self,
+        graph,
+        model_name="gpt-4o",
+        model_provider="openai",
+        chain_of_thought=True,
+        run_id=None,
+        logger=None,
+        progress_callback=None,
+    ):
         self.graph = graph
         self.model_name = model_name
         self.chain_of_thought = chain_of_thought
-        rate_limiter = InMemoryRateLimiter(**RATE_LIMITER_KWARGS[model_name])
+        self.run_id = run_id
+        self.logger = logger
+        self.progress_callback = progress_callback
+        rate_limiter = InMemoryRateLimiter(
+            **RATE_LIMITER_KWARGS.get(model_name, RATE_LIMITER_KWARGS["gpt-4o-mini"])
+        )
         if model_provider == 'ollama':
             self.model = ChatOllama(model=model_name, base_url=os.environ['OLLAMA_URI'])
+        elif model_provider == "azure-openai-aad":
+            self.model = self._build_azure_openai_aad_model(model_name)
         else:
             chat_kwargs = {}
 
@@ -196,6 +219,7 @@ class LiteralMessagePassing(ABC):
         self.num_fallbacks = [0 for v in graph.nodes()]
         self.num_failed_json_parsings_after_retry = [0 for v in graph.nodes()]
         self.num_failed_answer_parsings_after_retry = [0 for v in graph.nodes()]
+        self.model_errors = []
 
         self.bootstrap_template = PromptTemplate.from_template(
             """You are an agent that is connected with other agents (your neighbors), who you communicate with. Your neighbors can in turn communicate with their neighbors and so forth. {short_task_description}
@@ -224,11 +248,78 @@ It is not mandatory to send a message to every neighbor in every round. If you d
         self.bootstrap_ask_for_first_messages = PromptTemplate.from_template("What are the first messages you want to send to your neighbors? {cot_prompt} Output your messages in JSON format as specified earlier.")
         self.format_instructions = PromptTemplate.from_template("{question} Format your answer as follows: '### Final Answer ###', followed by your final answer. Don't use any text for your final answer except one of these valid options: {valid_answers}")
 
+    async def _emit_progress(self, event, **fields):
+        if self.progress_callback is None:
+            return
+        result = self.progress_callback(event, **fields)
+        if asyncio.iscoroutine(result):
+            await result
+
+    def _build_azure_openai_aad_model(self, model_name: str):
+        if AzureCliCredential is None or get_bearer_token_provider is None:
+            raise ImportError(
+                "azure-identity is required for Azure OpenAI AAD auth. "
+                "Install project dependencies again to pick up the new package."
+            )
+
+        endpoint = os.getenv("GPT_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
+        if not endpoint:
+            raise ValueError(
+                "Azure OpenAI AAD auth requires GPT_ENDPOINT or AZURE_OPENAI_ENDPOINT."
+            )
+
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+        credential = AzureCliCredential()
+        token_provider = get_bearer_token_provider(
+            credential,
+            "https://cognitiveservices.azure.com/.default",
+        )
+
+        return AzureChatOpenAI(
+            azure_endpoint=endpoint,
+            azure_deployment=model_name,
+            azure_ad_token_provider=token_provider,
+            api_version=api_version,
+            max_retries=5,
+            model=model_name,
+        )
+
+    def _record_model_error(self, node_id, phase, exc):
+        node_name = self.graph.nodes[node_id].get("name", str(node_id))
+        error = {
+            "node_id": node_id,
+            "node_name": node_name,
+            "phase": phase,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        self.model_errors.append(error)
+        if self.logger:
+            self.logger.error(
+                "model_call_failed",
+                extra={
+                    "fields": {
+                        "event": "model_call_failed",
+                        "run_id": self.run_id,
+                        "node_id": node_id,
+                        "node_name": node_name,
+                        "phase": phase,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                },
+            )
+
     async def fallback_json_request(self, node_id):
         self.num_fallbacks[node_id] += 1
         user_message = HumanMessage(content="Your messages could not be parsed into JSON. Please check your response and try again.")
         config = {"configurable": {"thread_id": str(node_id)}}
-        response = await self.app.ainvoke({'messages': [user_message]}, config=config)
+        try:
+            response = await self.app.ainvoke({'messages': [user_message]}, config=config)
+        except Exception as exc:
+            self._record_model_error(node_id, "fallback_json_request", exc)
+            return {}
         self.chat_history[node_id] = messages_to_dict(response['messages'])
         last_message = self.chat_history[node_id][-1]['data']['content']
         messages_sent = parse_messages(last_message)
@@ -241,7 +332,11 @@ It is not mandatory to send a message to every neighbor in every round. If you d
         self.num_fallbacks[node_id] += 1
         user_message = HumanMessage(content="Your answer could not be parsed. Please check your answer and try again.")
         config = {"configurable": {"thread_id": str(node_id)}}
-        response = await self.app.ainvoke({'messages': [user_message]}, config=config)
+        try:
+            response = await self.app.ainvoke({'messages': [user_message]}, config=config)
+        except Exception as exc:
+            self._record_model_error(node_id, "fallback_answer_request", exc)
+            return None
         self.chat_history[node_id] = messages_to_dict(response['messages'])
         last_message = self.chat_history[node_id][-1]['data']['content']
         messages_sent = self.parse_answer(node_id, last_message)
@@ -279,8 +374,11 @@ It is not mandatory to send a message to every neighbor in every round. If you d
         for node, result in zip(self.graph.nodes(), results):
             message, fallback = result
             if message is None:
-                fallback_nodes.append(node)
-                fallback_tasks.append(fallback)
+                if fallback is None:
+                    self.messages[node] = None
+                else:
+                    fallback_nodes.append(node)
+                    fallback_tasks.append(fallback)
             else:
                 self.messages[node] = message
 
@@ -303,7 +401,11 @@ It is not mandatory to send a message to every neighbor in every round. If you d
         user_message = HumanMessage(content=self.bootstrap_ask_for_first_messages.format(cot_prompt= self.cot_prompt))
 
         config = {"configurable": {"thread_id": str(node_id)}}
-        response = await self.app.ainvoke({"messages": [system_message, user_message]}, config=config)
+        try:
+            response = await self.app.ainvoke({"messages": [system_message, user_message]}, config=config)
+        except Exception as exc:
+            self._record_model_error(node_id, "bootstrap", exc)
+            return {}, None
         self.chat_history[node_id] = messages_to_dict(response['messages'])
 
         return await self.parse_response_to_dict(self.chat_history[node_id], node_id)
@@ -346,7 +448,12 @@ It is not mandatory to send a message to every neighbor in every round. If you d
         user_message = HumanMessage(content=messages_str)
 
         config = {"configurable": {"thread_id": str(node_id)}}
-        response = await self.app.ainvoke({'messages': [user_message]}, config=config)
+        try:
+            response = await self.app.ainvoke({'messages': [user_message]}, config=config)
+        except Exception as exc:
+            phase = "final_answer" if last_round else "message_passing"
+            self._record_model_error(node_id, phase, exc)
+            return (None if last_round else {}), None
         self.chat_history[node_id] = messages_to_dict(response['messages'])
 
         return await self.parse_response_to_dict(self.chat_history[node_id], node_id, last_round)
@@ -354,6 +461,11 @@ It is not mandatory to send a message to every neighbor in every round. If you d
     async def pass_messages(self):
         """Executes synchronous message passing rounds."""
         for round in range(1, self.rounds+1):
+            await self._emit_progress(
+                "round_start",
+                round=round,
+                rounds=self.rounds,
+            )
             rounds_left = self.rounds - round
             all_messages_sent = {}
             for v in self.graph.nodes():
@@ -372,6 +484,12 @@ It is not mandatory to send a message to every neighbor in every round. If you d
 
             results = await asyncio.gather(*tasks)
             await self.update_messages(results)
+            await self._emit_progress(
+                "round_done",
+                round=round,
+                rounds=self.rounds,
+                model_error_count=len(self.model_errors),
+            )
 
         return self.get_final_answers(self.messages, len(self.graph.nodes))
     
@@ -394,7 +512,7 @@ It is not mandatory to send a message to every neighbor in every round. If you d
 
 class Consensus(LiteralMessagePassing):
     """Implementation for consensus without malicious parties."""
-    def __init__(self, graph, rounds, model_name="gpt-4o", model_provider="openai", chain_of_thought=True):
+    def __init__(self, graph, rounds, model_name="gpt-4o", model_provider="openai", chain_of_thought=True, run_id=None, logger=None, progress_callback=None):
         self.rounds = rounds
         self.short_task_description = "Your goal is to agree on a single value with the other agents. The possible values that you can decide on are either 0 or 1."
         self.long_problem_description = (
@@ -402,7 +520,7 @@ class Consensus(LiteralMessagePassing):
         )
         self.question_for_prediction = "Please answer with the value you agreed on."
 
-        super().__init__(graph, model_name, model_provider, chain_of_thought)
+        super().__init__(graph, model_name, model_provider, chain_of_thought, run_id, logger, progress_callback)
 
     def get_score(self, answers: list[str]) -> float:
         valid_values = {"0", "1"}
@@ -417,7 +535,7 @@ class Consensus(LiteralMessagePassing):
 
 
 class LeaderElection(LiteralMessagePassing):
-    def __init__(self, graph, rounds, model_name="gpt-4o", model_provider="openai", chain_of_thought=True):
+    def __init__(self, graph, rounds, model_name="gpt-4o", model_provider="openai", chain_of_thought=True, run_id=None, logger=None, progress_callback=None):
         self.rounds = rounds
         self.short_task_description = "Your task is to collaboratively solve the problem of electing a single leader."
         self.long_problem_description = (
@@ -425,7 +543,7 @@ class LeaderElection(LiteralMessagePassing):
             "The final result should be such that exactly one agent responds with 'Yes' and all others say 'No' as there should be exactly one leader."
         )
         self.question_for_prediction = "Are you the leader?"
-        super().__init__(graph, model_name, model_provider, chain_of_thought)
+        super().__init__(graph, model_name, model_provider, chain_of_thought, run_id, logger, progress_callback)
 
     def get_score(self, answers: list[str]) -> float:
         valid_values = {"No", "Yes"}
@@ -438,7 +556,7 @@ class LeaderElection(LiteralMessagePassing):
 
 
 class Matching(LiteralMessagePassing):
-    def __init__(self, graph, rounds, model_name="gpt-4o-mini", model_provider="openai", chain_of_thought=True):
+    def __init__(self, graph, rounds, model_name="gpt-4o-mini", model_provider="openai", chain_of_thought=True, run_id=None, logger=None, progress_callback=None):
         self.rounds = rounds
         self.short_task_description = "Your task is to find build groups of two agents each which can communicate with each other."
         self.long_problem_description = (
@@ -446,7 +564,7 @@ class Matching(LiteralMessagePassing):
             "In the end, every agent should only be in at most one group and agents in the same group have to name each other as the second group member consistently."
         )
         self.question_for_prediction = "Please answer with the name of the neighbor you build a group with or 'None' if all your neighbors are already assigned to other groups."
-        super().__init__(graph, model_name, model_provider, chain_of_thought)
+        super().__init__(graph, model_name, model_provider, chain_of_thought, run_id, logger, progress_callback)
 
     def get_score(self, answers: list[str]) -> float:
         graph = self.graph
@@ -475,8 +593,8 @@ class Matching(LiteralMessagePassing):
 
 
 class Coloring(LiteralMessagePassing):
-    def __init__(self, graph: nx.Graph, rounds: int, num_colors: int | None = None, model_name="gpt-4o-mini", model_provider="openai", chain_of_thought=True):
-        super().__init__(graph, model_name, model_provider, chain_of_thought)
+    def __init__(self, graph: nx.Graph, rounds: int, num_colors: int | None = None, model_name="gpt-4o-mini", model_provider="openai", chain_of_thought=True, run_id=None, logger=None, progress_callback=None):
+        super().__init__(graph, model_name, model_provider, chain_of_thought, run_id, logger, progress_callback)
         self.rounds = rounds
 
         if num_colors is not None:
@@ -525,14 +643,14 @@ def score_vertex_cover(results, graph):
 
 
 class VertexCover(LiteralMessagePassing):
-    def __init__(self, graph, rounds, model_name="gpt-4o-mini", model_provider="openai", chain_of_thought=True):
+    def __init__(self, graph, rounds, model_name="gpt-4o-mini", model_provider="openai", chain_of_thought=True, run_id=None, logger=None, progress_callback=None):
         """https://math.stackexchange.com/a/1764484.
         A practical example is that the minimal vertex cover receives resources and is 
         important that every channel of communication always has access to this resource,
         meaning there is no need for two-hop communication to obtain some resource. Fundamentally,
         the agents solve a resource allocation problem, which also touches into fairness.
         """
-        super().__init__(graph, model_name, model_provider, chain_of_thought)
+        super().__init__(graph, model_name, model_provider, chain_of_thought, run_id, logger, progress_callback)
         self.rounds = rounds
         self.short_task_description = """Your task is to select, among all agents, a group of coordinators
 such that whenever two agents communicate at least one of them is a coordinator. The group of coordinators

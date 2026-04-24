@@ -37,11 +37,29 @@ For anthropic:
 ```bash
 export ANTHROPIC_API_KEY=<INSERT-API-KEY-HERE>
 ```
+For Azure OpenAI with Microsoft Entra ID / Azure AD auth:
+```bash
+export USE_AZURE_OPENAI_AAD=1
+export GPT_ENDPOINT=https://societalllm.openai.azure.com/
+export AZURE_OPENAI_API_VERSION=2024-12-01-preview
+# Optional if your Azure deployment name differs from --model
+export AZURE_OPENAI_DEPLOYMENT=<YOUR_DEPLOYMENT_NAME>
+az login
+```
+When `USE_AZURE_OPENAI_AAD=1` is set for an OpenAI model, the framework uses `AzureCliCredential`
+and obtains a bearer token for `https://cognitiveservices.azure.com/.default`. The deployment name
+defaults to the value passed with `--model` unless `AZURE_OPENAI_DEPLOYMENT` is set explicitly.
 Then, you can start a run:
 ```bash
 python main.py --graph_size 16 --task coloring --rounds 8 --samples_per_graph_model 3 --model gemini-2.0-flash 
 ```
 This runs 12 instances of the coloring task of 16 nodes for 8 rounds, with 4 different graph classes and 3 samples per graph class each, with gemini-2.0-flash as the model. See `main.sh` to run a complete run of the benchmark for one particular model.
+
+Experiments are serial by default. To run multiple graph/sample/repeated-run experiments concurrently within one `main.py` process, set:
+```bash
+python main.py --graph_size 16 --task coloring --rounds 8 --samples_per_graph_model 3 --model gemini-2.0-flash --max_parallel_experiments 2
+```
+Use `--log_level DEBUG|INFO|WARNING|ERROR` to adjust structured progress logging, and `--log_file path/to/run.log` to write the same logs to a file.
 
 ## Running more extensive experiments
 To run the AgentsNet benchmark on all tasks with 12 graphs each (of size 16), you can use:
